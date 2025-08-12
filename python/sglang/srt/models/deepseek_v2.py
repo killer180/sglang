@@ -250,6 +250,16 @@ class DeepseekV2MoE(nn.Module):
 
         self.gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
 
+        additional_config = {}
+        if global_server_args_dict["enable_deepep_moe"]:
+            additional_config = dict(
+                deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]]
+            )
+        elif global_server_args_dict["enable_ep_moe_hetero"]:
+            additional_config = dict(
+                num_gpu_experts=global_server_args_dict["ep_moe_hetero_gpu_experts"]
+            )
+
         self.experts = get_moe_impl_class()(
             num_experts=config.n_routed_experts
             + self.num_fused_shared_experts
@@ -267,11 +277,7 @@ class DeepseekV2MoE(nn.Module):
             correction_bias=self.gate.e_score_correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
             prefix=add_prefix("experts", prefix),
-            **(
-                dict(deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]])
-                if global_server_args_dict["enable_deepep_moe"]
-                else {}
-            ),
+            **additional_config,
         )
 
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
@@ -340,16 +346,31 @@ class DeepseekV2MoE(nn.Module):
             return self.forward_deepep(hidden_states, forward_batch)
 
     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        shared_output = self._forward_shared_experts(hidden_states)
-        # router_logits: (num_tokens, n_experts)
+        if hasattr(self, "shared_experts") and getattr(
+            self.shared_experts.gate_up_proj, "use_intel_amx_backend", False
+        ):
+            return self.forward_cpu(hidden_states)
+
         router_logits = self.gate(hidden_states)
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
-        )
-        if not _is_cuda:
+        if global_server_args_dict["enable_ep_moe_hetero"]:
+            final_hidden_states, shared_output = self.experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                op_shared_experts=self._forward_shared_experts,
+            )
+        else:
+            shared_output = self._forward_shared_experts(hidden_states)
+            # router_logits: (num_tokens, n_experts)
+            
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states, router_logits=router_logits
+            )
+
+        if global_server_args_dict["enable_ep_moe_hetero"] or not _is_cuda:
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
+
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
@@ -449,6 +470,77 @@ class DeepseekV2MoE(nn.Module):
     def op_shared_experts(self, state):
         hidden_states_mlp_input = state.pop("hidden_states_mlp_input")
         if (self.num_fused_shared_experts == 0) and is_non_idle_and_non_empty(
+            state.forward_batch.forward_mode, hidden_states_mlp_input
+        ):
+            state.shared_output = self.shared_experts(hidden_states_mlp_input)
+        else:
+            state.shared_output = None
+
+    def op_prepare_experts(self, state):
+        if is_non_idle_and_non_empty(
+            state.forward_batch.forward_mode, state.hidden_states_mlp_input
+        ):
+            state.hidden_states_shape = state.hidden_states_mlp_input.shape
+            state.hidden_states_device = state.hidden_states_mlp_input.device
+            state.hidden_states_dtype = state.hidden_states_mlp_input.dtype
+            self.experts.forward_routed_experts_prepare(
+                hidden_states=state.hidden_states_mlp_input,
+                router_logits=state.router_logits,
+            )
+
+    def op_enqueue_experts(self, state):
+        if is_non_idle_and_non_empty(
+            state.forward_batch.forward_mode, state.hidden_states_mlp_input
+        ):
+            state.cpu_experts_result = self.experts.forward_routed_experts_enqueue(
+                hidden_states=state.hidden_states_mlp_input,
+                router_logits=state.router_logits,
+            )
+        else:
+            state.cpu_experts_result = None
+
+    def op_enqueue_experts_maybe_gpu(self, state):
+        router_logits = state.pop("router_logits")
+        if is_non_idle_and_non_empty(
+            state.forward_batch.forward_mode, state.hidden_states_mlp_input
+        ):
+            state.gpu_experts_result = self.experts.forward_routed_experts_maybe_gpu(
+                hidden_states=state.hidden_states_mlp_input,
+                router_logits=router_logits,
+            )
+        else:
+            state.gpu_experts_result = None
+
+    def op_sync_experts(self, state):
+        if (
+            state.forward_batch.forward_mode is not None
+        ) and not state.forward_batch.forward_mode.is_idle():
+            self.experts.forward_routed_experts_sync(
+                hidden_states_device=state.get("hidden_states_device"),
+            )
+
+    def op_combine_hetero_experts(self, state):
+        hidden_states_shape = state.pop("hidden_states_shape")
+        hidden_states_device = state.pop("hidden_states_device")
+        hidden_states_dtype = state.pop("hidden_states_dtype")
+        state.pop("hidden_states_mlp_input")
+        if (
+            state.forward_batch.forward_mode is not None
+        ) and not state.forward_batch.forward_mode.is_idle():
+            combined = self.experts.forward_routed_experts_combine(
+                hidden_states_shape=hidden_states_shape,
+                hidden_states_device=hidden_states_device,
+                hidden_states_dtype=hidden_states_dtype,
+                gpu_result=state.pop("gpu_experts_result"),
+                cpu_result=state.pop("cpu_experts_result"),
+            )
+            state.hidden_states_after_combine = combined
+        else:
+            state.hidden_states_after_combine = None
+
+    def op_shared_experts_keep_state(self, state):
+        hidden_states_mlp_input = state.hidden_states_mlp_input
+        if (self.n_share_experts_fusion == 0) and is_non_idle_and_non_empty(
             state.forward_batch.forward_mode, hidden_states_mlp_input
         ):
             state.shared_output = self.shared_experts(hidden_states_mlp_input)
@@ -1608,6 +1700,11 @@ class DeepseekV2Model(nn.Module):
 
         self.dp_size = get_local_attention_dp_size()
 
+        self.is_hetero = (
+            global_server_args_dict["enable_two_batch_overlap"]
+            and global_server_args_dict["two_batch_overlap_mode"] == "hetero"
+        )
+
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
 
@@ -1646,9 +1743,13 @@ class DeepseekV2Model(nn.Module):
                 )
 
         if normal_num_layers != total_num_layers:
+            if self.is_hetero:
+                enable_tbo = forward_batch.forward_mode.is_decode()
+            else:
+                enable_tbo = True
             hidden_states, residual = model_forward_maybe_tbo(
                 layers=self.layers[normal_num_layers:],
-                enable_tbo=True,
+                enable_tbo=enable_tbo,
                 positions=positions,
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,
@@ -1787,7 +1888,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     if "kv_b_proj" in name:
                         layer_id = int(name.split(".")[2])
                         # filter the nextn layer.
-                        if layer_id != self.config.num_hidden_layers:
+                        if layer_id < self.config.num_hidden_layers:
                             layer_ids.add(layer_id)
 
         for layer_id in layer_ids:

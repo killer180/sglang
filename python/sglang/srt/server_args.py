@@ -170,8 +170,6 @@ class ServerArgs:
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
     enable_dp_lm_head: bool = False
-    enable_two_batch_overlap: bool = False
-    enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
     ep_num_redundant_experts: int = 0
@@ -187,6 +185,10 @@ class ServerArgs:
     expert_distribution_recorder_buffer_size: Optional[int] = None
     enable_expert_distribution_metrics: bool = False
     deepep_config: Optional[str] = None
+    enable_two_batch_overlap: bool = True
+    two_batch_overlap_mode: Optional[Literal["deepep", "hetero"]] = "hetero"
+    enable_ep_moe_hetero: bool = True
+    ep_moe_hetero_gpu_experts: int = 0
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None
@@ -1207,9 +1209,26 @@ class ServerArgs:
             help="Enabling expert parallelism for moe. The ep size is equal to the tp size.",
         )
         parser.add_argument(
+            "--enable-ep-moe-hetero",
+            action="store_true",
+            help="Enabling hetero expert parallelism for moe. must be supplied with --enable-ep-moe",
+        )
+        parser.add_argument(
+            "--ep-moe-hetero-gpu-experts",
+            type=int,
+            default=ServerArgs.ep_moe_hetero_gpu_experts,
+            help="Number of gpu experts in hetero EP moe. 0 means half, positive number mean gpu expert in lower range, negative means higher range. For exampl, 30 means 0~29 on GPU, -50 means 206~255 on GPU",
+        )
+        parser.add_argument(
             "--enable-two-batch-overlap",
             action="store_true",
             help="Enabling two micro batches to overlap.",
+        )
+        parser.add_argument(
+            "--two-batch-overlap-mode",
+            type=str,
+            default=ServerArgs.two_batch_overlap_mode,
+            help="The model for two batch overlap, deepep mode will interleave compute and communicate in deepep implementation, hetero mode will interleave CPU and GPU operations for hetero pipe implementation.",
         )
         parser.add_argument(
             "--enable-torch-compile",

@@ -82,8 +82,10 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "enable_deepep_moe",
     "enable_dp_attention",
     "enable_two_batch_overlap",
+    "two_batch_overlap_mode",
     "enable_dp_lm_head",
     "enable_ep_moe",
+    "enable_ep_moe_hetero"
     "deepep_config",
     "enable_nan_detection",
     "flashinfer_mla_disable_ragged",
@@ -98,6 +100,8 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "triton_attention_reduce_in_fp32",
     "ep_num_redundant_experts",
     "mm_attention_backend",
+    "num_reserved_decode_tokens",
+
 ]
 
 # Put some global args for easy access
